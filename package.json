@@ -1,0 +1,14 @@
+{
+    "name": "migrations",
+    "version": "1.0.0",
+    "description": "Ordered schema migrations and bootstrap seed for the shared customer_management database",
+    "main": "run.js",
+    "private": true,
+    "scripts": {
+        "start": "node run.js"
+    },
+    "dependencies": {
+        "bcryptjs": "^3.0.2",
+        "pg": "^8.16.3"
+    }
+}

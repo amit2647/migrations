@@ -165,6 +165,7 @@ WHERE r.code = 'MARKETING_SPECIALIST'
     'leads.read', 'leads.create', 'leads.update',
     'customers.read',
     'services.read',
+    'reports.read',
     'communications.read', 'communications.create',
     'email.send',
     'email.templates.read'
@@ -197,6 +198,7 @@ WHERE r.code = 'SALES_REP'
     'leads.read', 'leads.create', 'leads.update',
     'customers.read', 'customers.create', 'customers.update',
     'services.read',
+    'reports.read',
     'communications.read', 'communications.create',
     'email.send',
     'email.templates.read'

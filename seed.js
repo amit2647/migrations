@@ -8,7 +8,8 @@ const ORG_SLUG = process.env.BOOTSTRAP_ORG_SLUG || "acme-corporation";
 const ADMIN_NAME = process.env.BOOTSTRAP_ADMIN_NAME || "Admin";
 const ADMIN_EMAIL = process.env.BOOTSTRAP_ADMIN_EMAIL || "admin@acme.example";
 const ADMIN_PASSWORD = process.env.BOOTSTRAP_ADMIN_PASSWORD || "ChangeMe123!";
-const SEED_DEMO_DATA = process.env.SEED_DEMO_DATA === "true";
+// On unless explicitly disabled. Only ever seeds an empty database, see seedDemoData.
+const SEED_DEMO_DATA = process.env.SEED_DEMO_DATA !== "false";
 
 const DEFAULT_SERVICES = [
   ["CRM Implementation", "Customer relationship management implementation and customization", "Technology"],
@@ -88,21 +89,127 @@ async function seedServices(client, organizationId) {
   console.log(`[SEED] created ${DEFAULT_SERVICES.length} default services`);
 }
 
-async function seedDemoLead(client, organizationId) {
-  const count = await client.query("SELECT COUNT(*)::int AS count FROM leads");
+/*
+ * Two leads and one customer, where the customer is what converting the first
+ * lead produces. There is no column linking a converted lead to its customer;
+ * lead-service's convertLead copies name/company/email/phone and the lead's
+ * services onto a new customer (segment Standard, owned by the converting user)
+ * and flips the lead to Converted. This reproduces exactly that footprint.
+ *
+ * example.com is reserved (RFC 2606), so mail sent to these contacts from the
+ * CRM can never reach a real person.
+ */
+const DEMO_CONVERTED_LEAD = {
+  name: "Priya Sharma",
+  company: "Acme Digital",
+  email: "priya@example.com",
+  phone: "9876543210",
+  channel: "WhatsApp",
+  score: 86,
+  services: ["CRM Implementation", "Data Analytics"],
+  createdDaysAgo: 14,
+  convertedDaysAgo: 7,
+};
 
-  if (count.rows[0].count > 0) {
+const DEMO_OPEN_LEAD = {
+  name: "Rahul Verma",
+  company: "Northwind Traders",
+  email: "rahul@example.com",
+  phone: "9123456780",
+  channel: "Website",
+  status: "Qualified",
+  score: 72,
+  services: ["Cloud Migration"],
+  createdDaysAgo: 3,
+};
+
+async function serviceIdsByName(client, organizationId, names) {
+  const result = await client.query(
+    "SELECT id FROM services WHERE organization_id = $1 AND name = ANY($2::text[]) ORDER BY id",
+    [organizationId, names],
+  );
+
+  return result.rows.map((row) => row.id);
+}
+
+async function insertLead(client, organizationId, ownerId, lead, status) {
+  const result = await client.query(
+    `INSERT INTO leads
+       (organization_id, owner_user_id, name, company, email, phone,
+        channel, status, score, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+             NOW() - make_interval(days => $10), NOW() - make_interval(days => $11))
+     RETURNING id`,
+    [
+      organizationId,
+      ownerId,
+      lead.name,
+      lead.company,
+      lead.email,
+      lead.phone,
+      lead.channel,
+      status,
+      lead.score,
+      lead.createdDaysAgo,
+      lead.convertedDaysAgo ?? lead.createdDaysAgo,
+    ],
+  );
+
+  const leadId = result.rows[0].id;
+
+  for (const serviceId of await serviceIdsByName(client, organizationId, lead.services)) {
+    await client.query(
+      "INSERT INTO lead_services (lead_id, service_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+      [leadId, serviceId],
+    );
+  }
+
+  return leadId;
+}
+
+async function seedDemoData(client, organizationId, ownerId) {
+  // Fresh databases only: seed runs on every boot, and partially re-seeding a
+  // database someone has already started using would duplicate their records.
+  const existing = await client.query(
+    "SELECT (SELECT COUNT(*) FROM leads)::int AS leads, (SELECT COUNT(*) FROM customers)::int AS customers",
+  );
+
+  if (existing.rows[0].leads > 0 || existing.rows[0].customers > 0) {
     return;
   }
 
-  await client.query(
-    `INSERT INTO leads
-       (organization_id, owner_user_id, name, company, email, phone, channel, status, score)
-     VALUES ($1, NULL, 'Priya Sharma', 'Acme Digital', 'priya@example.com', '9876543210', 'WhatsApp', 'Qualified', 86)`,
-    [organizationId],
+  const lead = DEMO_CONVERTED_LEAD;
+
+  await insertLead(client, organizationId, ownerId, lead, "Converted");
+
+  const customer = await client.query(
+    `INSERT INTO customers
+       (organization_id, owner_user_id, name, company, email, phone, segment,
+        created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, 'Standard',
+             NOW() - make_interval(days => $7), NOW() - make_interval(days => $7))
+     RETURNING id`,
+    [
+      organizationId,
+      ownerId,
+      lead.name,
+      lead.company,
+      lead.email,
+      lead.phone,
+      lead.convertedDaysAgo,
+    ],
   );
 
-  console.log("[SEED] created demo lead");
+  for (const serviceId of await serviceIdsByName(client, organizationId, lead.services)) {
+    await client.query(
+      "INSERT INTO customer_services (customer_id, service_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+      [customer.rows[0].id, serviceId],
+    );
+  }
+
+  await insertLead(client, organizationId, ownerId, DEMO_OPEN_LEAD, DEMO_OPEN_LEAD.status);
+
+  console.log("[SEED] created demo data: 2 leads, 1 customer converted from the first");
 }
 
 // Runs on every start, outside the migration ledger, so a half-bootstrapped
@@ -124,7 +231,7 @@ async function seed(client) {
     await seedServices(client, organizationId);
 
     if (SEED_DEMO_DATA) {
-      await seedDemoLead(client, organizationId);
+      await seedDemoData(client, organizationId, userId);
     }
 
     await client.query("COMMIT");

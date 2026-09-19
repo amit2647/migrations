@@ -12,8 +12,16 @@ const ADMIN_PASSWORD = process.env.BOOTSTRAP_ADMIN_PASSWORD || "ChangeMe123!";
 const SEED_DEMO_DATA = process.env.SEED_DEMO_DATA !== "false";
 
 const DEFAULT_SERVICES = [
-  ["CRM Implementation", "Customer relationship management implementation and customization", "Technology"],
-  ["Cloud Migration", "Cloud migration, modernization and infrastructure services", "Cloud"],
+  [
+    "CRM Implementation",
+    "Customer relationship management implementation and customization",
+    "Technology",
+  ],
+  [
+    "Cloud Migration",
+    "Cloud migration, modernization and infrastructure services",
+    "Cloud",
+  ],
   ["Data Analytics", "Business intelligence, reporting and analytics", "Data"],
   ["IT Support", "Technical support and managed IT services", "Support"],
   ["Consulting", "Business and technology consulting services", "Consulting"],
@@ -71,7 +79,9 @@ async function resolveAdminUser(client) {
 }
 
 async function seedServices(client, organizationId) {
-  const count = await client.query("SELECT COUNT(*)::int AS count FROM services");
+  const count = await client.query(
+    "SELECT COUNT(*)::int AS count FROM services",
+  );
 
   if (count.rows[0].count > 0) {
     return;
@@ -157,7 +167,11 @@ async function insertLead(client, organizationId, ownerId, lead, status) {
 
   const leadId = result.rows[0].id;
 
-  for (const serviceId of await serviceIdsByName(client, organizationId, lead.services)) {
+  for (const serviceId of await serviceIdsByName(
+    client,
+    organizationId,
+    lead.services,
+  )) {
     await client.query(
       "INSERT INTO lead_services (lead_id, service_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
       [leadId, serviceId],
@@ -200,16 +214,131 @@ async function seedDemoData(client, organizationId, ownerId) {
     ],
   );
 
-  for (const serviceId of await serviceIdsByName(client, organizationId, lead.services)) {
+  for (const serviceId of await serviceIdsByName(
+    client,
+    organizationId,
+    lead.services,
+  )) {
     await client.query(
       "INSERT INTO customer_services (customer_id, service_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
       [customer.rows[0].id, serviceId],
     );
   }
 
-  await insertLead(client, organizationId, ownerId, DEMO_OPEN_LEAD, DEMO_OPEN_LEAD.status);
+  await insertLead(
+    client,
+    organizationId,
+    ownerId,
+    DEMO_OPEN_LEAD,
+    DEMO_OPEN_LEAD.status,
+  );
 
-  console.log("[SEED] created demo data: 2 leads, 1 customer converted from the first");
+  console.log(
+    "[SEED] created demo data: 2 leads, 1 customer converted from the first",
+  );
+}
+
+/*
+ * One template and automation per supported event, all disabled. They send real
+ * mail from the organisation's real mailbox, so they must be opted into.
+ *
+ * Placeholders are resolved by emailTemplateService.renderTemplate from the
+ * event payload; an unknown one is left visible rather than blanked.
+ */
+const DEFAULT_TEMPLATES = [
+  {
+    name: "Welcome new lead",
+    event: "lead.created",
+    automation: "Welcome email on new lead",
+    subject: "Thanks for getting in touch, {{lead.name}}",
+    body: [
+      "Hi {{lead.name}},",
+      "",
+      "Thanks for your interest. We have received your enquiry and someone from our team will be in touch shortly.",
+      "",
+      "Best regards,",
+      "{{organization.name}}",
+    ].join("\n"),
+  },
+  {
+    name: "Lead converted",
+    event: "lead.converted",
+    automation: "Thank you on conversion",
+    subject: "Welcome aboard, {{lead.name}}",
+    body: [
+      "Hi {{lead.name}},",
+      "",
+      "We are delighted to be working with you. Your account is now active and your dedicated contact will reach out with next steps.",
+      "",
+      "Best regards,",
+      "{{organization.name}}",
+    ].join("\n"),
+  },
+  {
+    name: "Customer onboarding",
+    event: "customer.created",
+    automation: "Onboarding email for new customer",
+    subject: "Getting started with {{organization.name}}",
+    body: [
+      "Hi {{customer.name}},",
+      "",
+      "Welcome. This is a short note to introduce your account and how to reach us whenever you need anything.",
+      "",
+      "Best regards,",
+      "{{organization.name}}",
+    ].join("\n"),
+  },
+];
+
+async function seedEmailAutomations(client, organizationId, ownerId) {
+  const count = await client.query(
+    "SELECT COUNT(*)::int AS count FROM email_templates WHERE organization_id = $1",
+    [organizationId],
+  );
+
+  if (count.rows[0].count > 0) {
+    return;
+  }
+
+  for (const item of DEFAULT_TEMPLATES) {
+    const template = await client.query(
+      `INSERT INTO email_templates
+         (organization_id, name, subject, body, description, is_active, created_by)
+       VALUES ($1, $2, $3, $4, $5, true, $6)
+       ON CONFLICT (organization_id, name) DO NOTHING
+       RETURNING id`,
+      [
+        organizationId,
+        item.name,
+        item.subject,
+        item.body,
+        `Default template for ${item.event}`,
+        ownerId,
+      ],
+    );
+
+    if (template.rows.length === 0) {
+      continue;
+    }
+
+    await client.query(
+      `INSERT INTO email_automations
+         (organization_id, name, description, trigger_event, template_id, is_active)
+       VALUES ($1, $2, $3, $4, $5, false)
+       ON CONFLICT (organization_id, name) DO NOTHING`,
+      [
+        organizationId,
+        item.automation,
+        `Sends "${item.name}" when ${item.event} fires. Disabled until enabled.`,
+        item.event,
+        template.rows[0].id,
+      ],
+    );
+  }
+
+  console.log(
+    `[SEED] created ${DEFAULT_TEMPLATES.length} email templates and automations (all disabled)`,
+  );
 }
 
 // Runs on every start, outside the migration ledger, so a half-bootstrapped
@@ -229,6 +358,7 @@ async function seed(client) {
     );
 
     await seedServices(client, organizationId);
+    await seedEmailAutomations(client, organizationId, userId);
 
     if (SEED_DEMO_DATA) {
       await seedDemoData(client, organizationId, userId);

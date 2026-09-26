@@ -5,7 +5,8 @@
     "main": "run.js",
     "private": true,
     "scripts": {
-        "start": "node run.js"
+        "start": "node run.js",
+        "test": "node --test"
     },
     "dependencies": {
         "bcryptjs": "^3.0.2",

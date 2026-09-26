@@ -6,10 +6,17 @@
     "private": true,
     "scripts": {
         "start": "node run.js",
-        "test": "node --test"
+        "test": "node --test",
+        "lint": "eslint .",
+        "coverage": "node --test --experimental-test-coverage"
     },
     "dependencies": {
         "bcryptjs": "^3.0.2",
         "pg": "^8.16.3"
+    },
+    "devDependencies": {
+        "@eslint/js": "^9.39.0",
+        "eslint": "^9.39.0",
+        "globals": "^17.12.0"
     }
 }

@@ -1,16 +1,42 @@
+const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 
 // Matches the cost factor in identity-service/src/services/userService.js
 const BCRYPT_COST = 12;
 
+/*
+ * Two ways to bootstrap a new installation (bootstrapMode):
+ *
+ *   configured — BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD are both
+ *                set (CI, scripted deployments): the organization and its
+ *                first admin are created from them, as before.
+ *   first run  — neither is set: no admin is created. The organization's
+ *                defaults are prepared under a placeholder organization, and a
+ *                one-time setup code is printed to this log; the installer
+ *                finishes in the browser (identity-service POST /setup), naming
+ *                the organization and choosing their own admin credentials.
+ *
+ * There is no default password any more: a known one made every unconfigured
+ * install open to anyone who had read this file.
+ */
 const ORG_NAME = process.env.BOOTSTRAP_ORG_NAME || "Acme Corporation";
 const ORG_SLUG = process.env.BOOTSTRAP_ORG_SLUG || "acme-corporation";
+const PLACEHOLDER_ORG_NAME = process.env.BOOTSTRAP_ORG_NAME || "My organization";
+const PLACEHOLDER_ORG_SLUG = process.env.BOOTSTRAP_ORG_SLUG || "my-organization";
 const ADMIN_NAME = process.env.BOOTSTRAP_ADMIN_NAME || "Admin";
-const ADMIN_EMAIL = process.env.BOOTSTRAP_ADMIN_EMAIL || "admin@acme.example";
-const ADMIN_PASSWORD = process.env.BOOTSTRAP_ADMIN_PASSWORD || "ChangeMe123!";
+const ADMIN_EMAIL = (process.env.BOOTSTRAP_ADMIN_EMAIL || "").trim();
+const ADMIN_PASSWORD = process.env.BOOTSTRAP_ADMIN_PASSWORD || "";
+const APP_URL = process.env.PUBLIC_APP_URL || "the app";
+
+// The password this file used to fall back on; never accepted for a new admin.
+const RETIRED_DEFAULT_PASSWORD = "ChangeMe123!";
+const MIN_ADMIN_PASSWORD = 12;
+const SETUP_CODE_HOURS = 24;
 // On unless explicitly disabled. Only ever seeds an empty database, see seedDemoData.
 const SEED_DEMO_DATA = process.env.SEED_DEMO_DATA !== "false";
 
+// Generic services for the plain CRM. Marked seeded_default (migration 021):
+// installing a profession bundle removes the ones nothing uses.
 const DEFAULT_SERVICES = [
   [
     "CRM Implementation",
@@ -27,10 +53,54 @@ const DEFAULT_SERVICES = [
   ["Consulting", "Business and technology consulting services", "Consulting"],
 ];
 
-async function resolveOrganization(client) {
+function bootstrapMode(env) {
+  const email = (env.BOOTSTRAP_ADMIN_EMAIL || "").trim();
+  const password = env.BOOTSTRAP_ADMIN_PASSWORD || "";
+
+  if (email && password) {
+    return "configured";
+  }
+
+  if (email || password) {
+    throw new Error(
+      "BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD go together: set both to create the admin from .env, or neither to set it up in the browser",
+    );
+  }
+
+  return "firstRun";
+}
+
+// Why a configured admin password cannot be used for a new admin, or null.
+function adminPasswordProblem(password) {
+  if (password === RETIRED_DEFAULT_PASSWORD) {
+    return "BOOTSTRAP_ADMIN_PASSWORD is the old public default; choose your own";
+  }
+
+  if (password.length < MIN_ADMIN_PASSWORD) {
+    return `BOOTSTRAP_ADMIN_PASSWORD must be at least ${MIN_ADMIN_PASSWORD} characters`;
+  }
+
+  return null;
+}
+
+// A setup code that is easy to read out and type: 16 characters, no 0/O/1/I.
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+function newSetupCode() {
+  const bytes = crypto.randomBytes(16);
+  const chars = [...bytes].map((byte) => CODE_ALPHABET[byte % CODE_ALPHABET.length]).join("");
+  return chars.match(/.{4}/g).join("-");
+}
+
+// Matches identity-service's setupService: case and dashes do not matter.
+function setupCodeHash(code) {
+  return crypto.createHash("sha256").update(String(code).toUpperCase().replace(/[^A-Z0-9]/g, "")).digest("hex");
+}
+
+async function resolveOrganization(client, name = ORG_NAME, slug = ORG_SLUG) {
   const bySlug = await client.query(
     "SELECT id FROM organizations WHERE slug = $1",
-    [ORG_SLUG],
+    [slug],
   );
 
   if (bySlug.rows.length > 0) {
@@ -47,10 +117,10 @@ async function resolveOrganization(client) {
 
   const created = await client.query(
     "INSERT INTO organizations (name, slug) VALUES ($1, $2) RETURNING id",
-    [ORG_NAME, ORG_SLUG],
+    [name, slug],
   );
 
-  console.log(`[SEED] created organization ${ORG_NAME} (${ORG_SLUG})`);
+  console.log(`[SEED] created organization ${name} (${slug})`);
 
   return created.rows[0].id;
 }
@@ -64,6 +134,12 @@ async function resolveAdminUser(client) {
   // Never touch an existing account's password_hash.
   if (existing.rows.length > 0) {
     return existing.rows[0].id;
+  }
+
+  const problem = adminPasswordProblem(ADMIN_PASSWORD);
+
+  if (problem) {
+    throw new Error(problem);
   }
 
   const passwordHash = await bcrypt.hash(ADMIN_PASSWORD, BCRYPT_COST);
@@ -89,8 +165,8 @@ async function seedServices(client, organizationId) {
 
   for (const [name, description, category] of DEFAULT_SERVICES) {
     await client.query(
-      `INSERT INTO services (organization_id, name, description, category, status)
-       VALUES ($1, $2, $3, $4, 'Active')
+      `INSERT INTO services (organization_id, name, description, category, status, seeded_default)
+       VALUES ($1, $2, $3, $4, 'Active', TRUE)
        ON CONFLICT (organization_id, name) DO NOTHING`,
       [organizationId, name, description, category],
     );
@@ -341,36 +417,128 @@ async function seedEmailAutomations(client, organizationId, ownerId) {
   );
 }
 
+// The first administrator of any organization, if there is one.
+async function existingAdmin(client) {
+  const result = await client.query(
+    `SELECT ou.organization_id, ou.user_id FROM organization_users ou
+     JOIN roles r ON r.id = ou.role_id
+     WHERE r.code = 'SUPER_ADMIN'
+     ORDER BY ou.organization_id, ou.user_id
+     LIMIT 1`,
+  );
+
+  return result.rows[0] || null;
+}
+
+async function markSetupCompleted(client, userId) {
+  await client.query(
+    `INSERT INTO install_setup (id, completed_at, completed_by, code_hash, updated_at)
+     VALUES (TRUE, NOW(), $1, NULL, NOW())
+     ON CONFLICT (id) DO UPDATE SET
+       completed_at = COALESCE(install_setup.completed_at, NOW()),
+       completed_by = COALESCE(install_setup.completed_by, EXCLUDED.completed_by),
+       code_hash = NULL,
+       updated_at = NOW()`,
+    [userId],
+  );
+}
+
+// A fresh code on every start while setup is pending; the previous one stops working.
+async function issueSetupCode(client) {
+  const code = newSetupCode();
+
+  await client.query(
+    `INSERT INTO install_setup (id, code_hash, code_created_at, failed_attempts, completed_at, completed_by, updated_at)
+     VALUES (TRUE, $1, NOW(), 0, NULL, NULL, NOW())
+     ON CONFLICT (id) DO UPDATE SET
+       code_hash = EXCLUDED.code_hash, code_created_at = NOW(), failed_attempts = 0,
+       completed_at = NULL, completed_by = NULL, updated_at = NOW()`,
+    [setupCodeHash(code)],
+  );
+
+  return code;
+}
+
+function printSetupCode(code) {
+  const lines = [
+    "This installation has no administrator yet.",
+    `Open ${APP_URL} and finish setup with this one-time code:`,
+    "",
+    `    ${code}`,
+    "",
+    `It works once and expires in ${SETUP_CODE_HOURS} hours. For a new one, run:`,
+    "    docker compose up migrate",
+  ];
+  const rule = "=".repeat(66);
+
+  console.log(`[SETUP] ${rule}`);
+  lines.forEach((line) => console.log(`[SETUP] ${line}`));
+  console.log(`[SETUP] ${rule}`);
+}
+
 // Runs on every start, outside the migration ledger, so a half-bootstrapped
 // database heals itself on the next boot.
 async function seed(client) {
+  const mode = bootstrapMode(process.env);
+  let setupCode = null;
+
   try {
     await client.query("BEGIN");
 
-    const organizationId = await resolveOrganization(client);
-    const userId = await resolveAdminUser(client);
+    if (mode === "configured") {
+      const organizationId = await resolveOrganization(client);
+      const userId = await resolveAdminUser(client);
 
-    await client.query(
-      `INSERT INTO organization_users (organization_id, user_id, role_id)
-       SELECT $1, $2, r.id FROM roles r WHERE r.code = 'SUPER_ADMIN'
-       ON CONFLICT (organization_id, user_id) DO NOTHING`,
-      [organizationId, userId],
-    );
+      await client.query(
+        `INSERT INTO organization_users (organization_id, user_id, role_id)
+         SELECT $1, $2, r.id FROM roles r WHERE r.code = 'SUPER_ADMIN'
+         ON CONFLICT (organization_id, user_id) DO NOTHING`,
+        [organizationId, userId],
+      );
 
-    await seedServices(client, organizationId);
-    await seedEmailAutomations(client, organizationId, userId);
+      await seedServices(client, organizationId);
+      await seedEmailAutomations(client, organizationId, userId);
 
-    if (SEED_DEMO_DATA) {
-      await seedDemoData(client, organizationId, userId);
+      if (SEED_DEMO_DATA) {
+        await seedDemoData(client, organizationId, userId);
+      }
+
+      await markSetupCompleted(client, userId);
+      console.log(`[SEED] bootstrap complete (organization ${organizationId})`);
+    } else {
+      const admin = await existingAdmin(client);
+
+      if (admin) {
+        // Already set up (in the browser, or by an earlier configured start).
+        await seedServices(client, admin.organization_id);
+        await seedEmailAutomations(client, admin.organization_id, admin.user_id);
+        await markSetupCompleted(client, admin.user_id);
+        console.log(`[SEED] bootstrap complete (organization ${admin.organization_id})`);
+      } else {
+        // No demo data: someone setting up in the browser is installing for real.
+        const organizationId = await resolveOrganization(client, PLACEHOLDER_ORG_NAME, PLACEHOLDER_ORG_SLUG);
+
+        await seedServices(client, organizationId);
+        await seedEmailAutomations(client, organizationId, null);
+        setupCode = await issueSetupCode(client);
+        console.log(`[SEED] waiting for first-run setup (organization ${organizationId})`);
+      }
     }
 
     await client.query("COMMIT");
-
-    console.log(`[SEED] bootstrap complete (organization ${organizationId})`);
   } catch (error) {
     await client.query("ROLLBACK");
     throw new Error(`seed failed: ${error.message}`);
   }
+
+  // Only once the code is stored.
+  if (setupCode) {
+    printSetupCode(setupCode);
+  }
 }
 
 module.exports = seed;
+module.exports.bootstrapMode = bootstrapMode;
+module.exports.adminPasswordProblem = adminPasswordProblem;
+module.exports.newSetupCode = newSetupCode;
+module.exports.setupCodeHash = setupCodeHash;
